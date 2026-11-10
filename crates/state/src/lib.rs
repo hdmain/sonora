@@ -403,6 +403,11 @@ pub fn init(
         io,
         cx,
     );
+    // Softens the music from every text field without the field knowing about playback.
+    let duck = playback.clone();
+    ui::watch_typing(cx, move |cx| {
+        duck.update(cx, |playback, cx| playback.note_typing(cx));
+    });
 
     cx.set_global(Sonora {
         session,
