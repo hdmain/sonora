@@ -38,6 +38,7 @@ mod snapshot;
 mod song;
 mod tags;
 mod toast;
+mod typing;
 mod updates;
 mod usage;
 mod vault;
@@ -403,11 +404,8 @@ pub fn init(
         io,
         cx,
     );
-    // Softens the music from every text field without the field knowing about playback.
-    let duck = playback.clone();
-    ui::watch_typing(cx, move |cx| {
-        duck.update(cx, |playback, cx| playback.note_typing(cx));
-    });
+    // Softens the music while typing anywhere on the computer, with in-app fields as fallback.
+    typing::attach(playback.clone(), settings.clone(), cx);
 
     cx.set_global(Sonora {
         session,
