@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-use gpui::{App, AppContext as _, Entity, Global};
+use gpui::{App, Entity, Global};
 use tokio::sync::mpsc;
 
 use crate::{AppSettings, Playback};
@@ -88,12 +88,7 @@ fn start(playback: Entity<Playback>, cx: &mut App) -> Option<Watch> {
             let Some(playback) = playback.upgrade() else {
                 break;
             };
-            if playback
-                .update(cx, |playback, cx| playback.note_typing(cx))
-                .is_err()
-            {
-                break;
-            }
+            playback.update(cx, |playback, cx| playback.note_typing(cx));
             cx.background_executor().timer(PULSE).await;
             while rx.try_recv().is_ok() {
                 pending.store(false, Ordering::Relaxed);
@@ -125,6 +120,7 @@ mod pulse {
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
+    use std::ptr;
     use std::sync::OnceLock;
 
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
@@ -132,41 +128,40 @@ mod platform {
         GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG, SetWindowsHookExW,
+        CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW, SetWindowsHookExW,
         UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
     };
 
-    struct HookState {
+    /// Send-safe bits the hook needs. The HHOOK itself stays on the pump thread.
+    struct Shared {
         tx: mpsc::UnboundedSender<()>,
         pending: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
-        hook: HHOOK,
-        thread: u32,
     }
 
-    static STATE: OnceLock<std::sync::Mutex<Option<HookState>>> = OnceLock::new();
+    static SHARED: OnceLock<std::sync::Mutex<Option<Shared>>> = OnceLock::new();
 
     pub fn spawn(
         tx: mpsc::UnboundedSender<()>,
         stop: Arc<AtomicBool>,
         pending: Arc<AtomicBool>,
     ) -> Option<JoinHandle<()>> {
-        let state = STATE.get_or_init(|| std::sync::Mutex::new(None));
+        let shared = SHARED.get_or_init(|| std::sync::Mutex::new(None));
         std::thread::Builder::new()
             .name("typing-duck".into())
             .spawn(move || {
-                let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), 0, 0) };
-                if hook == 0 {
+                let hook = unsafe {
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), ptr::null_mut(), 0)
+                };
+                if hook.is_null() {
                     log::warn!("typing: SetWindowsHookEx failed");
                     return;
                 }
                 let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-                *state.lock().unwrap() = Some(HookState {
+                *shared.lock().unwrap() = Some(Shared {
                     tx,
                     pending,
                     stop: stop.clone(),
-                    hook,
-                    thread,
                 });
 
                 let stopper = stop.clone();
@@ -175,14 +170,12 @@ mod platform {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                     unsafe {
-                        windows_sys::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
-                            thread, WM_QUIT, 0, 0,
-                        );
+                        PostThreadMessageW(thread, WM_QUIT, 0, 0);
                     }
                 });
 
                 let mut msg = MSG {
-                    hwnd: 0,
+                    hwnd: ptr::null_mut(),
                     message: 0,
                     wParam: 0,
                     lParam: 0,
@@ -190,10 +183,10 @@ mod platform {
                     pt: POINT { x: 0, y: 0 },
                 };
                 unsafe {
-                    while GetMessageW(&mut msg, 0, 0, 0) > 0 {}
+                    while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {}
                     UnhookWindowsHookEx(hook);
                 }
-                *state.lock().unwrap() = None;
+                *shared.lock().unwrap() = None;
                 let _ = watcher.join();
             })
             .ok()
@@ -203,16 +196,16 @@ mod platform {
         if code >= 0 && (wparam == WM_KEYDOWN as WPARAM || wparam == WM_SYSKEYDOWN as WPARAM) {
             let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
             if typing_key(info.vkCode) && !shortcut_held() {
-                if let Ok(state) = STATE.get().unwrap().lock() {
-                    if let Some(state) = state.as_ref() {
-                        if !state.stop.load(Ordering::Relaxed) {
-                            pulse::kick(&state.tx, &state.pending);
+                if let Ok(shared) = SHARED.get().unwrap().lock() {
+                    if let Some(shared) = shared.as_ref() {
+                        if !shared.stop.load(Ordering::Relaxed) {
+                            pulse::kick(&shared.tx, &shared.pending);
                         }
                     }
                 }
             }
         }
-        unsafe { CallNextHookEx(0, code, wparam, lparam) }
+        unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
     }
 
     fn shortcut_held() -> bool {
