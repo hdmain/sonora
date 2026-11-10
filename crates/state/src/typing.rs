@@ -60,13 +60,9 @@ fn apply(playback: &Entity<Playback>, want: bool, cx: &mut App) {
         return;
     }
 
-    // Drop any running observer first.
-    if let Some(installed) = cx.try_global_mut::<Installed>() {
-        installed.0 = None;
-    }
-
+    // Replacing the global drops any running observer and joins its stop flag.
+    cx.set_global(Installed(None));
     if !want {
-        cx.set_global(Installed(None));
         return;
     }
 
@@ -74,7 +70,6 @@ fn apply(playback: &Entity<Playback>, want: bool, cx: &mut App) {
         Some(watch) => cx.set_global(Installed(Some(watch))),
         None => {
             log::warn!("typing: system keyboard observer unavailable; in-app fields still duck");
-            cx.set_global(Installed(None));
         }
     }
 }
@@ -85,16 +80,15 @@ fn start(playback: Entity<Playback>, cx: &mut App) -> Option<Watch> {
     let (tx, mut rx) = mpsc::unbounded_channel::<()>();
 
     let pump = platform::spawn(tx, stop.clone(), pending.clone())?;
+    let playback = playback.downgrade();
 
     let bridge = cx.spawn(async move |cx| {
         while rx.recv().await.is_some() {
             pending.store(false, Ordering::Relaxed);
-            if playback
-                .update(cx, |playback, cx| playback.note_typing(cx))
-                .is_err()
-            {
+            let Some(playback) = playback.upgrade() else {
                 break;
-            }
+            };
+            playback.update(cx, |playback, cx| playback.note_typing(cx));
             cx.background_executor().timer(PULSE).await;
             while rx.try_recv().is_ok() {
                 pending.store(false, Ordering::Relaxed);
@@ -176,7 +170,7 @@ mod platform {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                     unsafe {
-                        windows_sys::Win32::System::Threading::PostThreadMessageW(
+                        windows_sys::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
                             thread, WM_QUIT, 0, 0,
                         );
                     }
@@ -272,12 +266,8 @@ mod platform {
     const KEY_COMMAND: u16 = 55;
     const KEY_RIGHT_COMMAND: u16 = 54;
 
-    type Callback = unsafe extern "C" fn(
-        CGEventTapProxy,
-        CGEventType,
-        CGEventRef,
-        *mut c_void,
-    ) -> CGEventRef;
+    type Callback =
+        unsafe extern "C" fn(CGEventTapProxy, CGEventType, CGEventRef, *mut c_void) -> CGEventRef;
 
     struct TapCtx {
         tx: mpsc::UnboundedSender<()>,
@@ -380,8 +370,8 @@ mod platform {
         if ty == K_CG_EVENT_KEY_DOWN && !info.is_null() {
             let ctx = unsafe { &*(info as *const TapCtx) };
             if !ctx.stop.load(Ordering::Relaxed) {
-                let key =
-                    unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) } as u16;
+                let key = unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) }
+                    as u16;
                 if typing_key(key) && !shortcut_held() {
                     pulse::kick(&ctx.tx, &ctx.pending);
                 }
@@ -402,10 +392,7 @@ mod platform {
     }
 
     fn typing_key(key: u16) -> bool {
-        matches!(
-            key,
-            0..=50 | 36 | 48 | 49 | 51 | 76
-        ) && !matches!(key, 53 | 55..=63)
+        matches!(key, 0..=50 | 36 | 48 | 49 | 51 | 76) && !matches!(key, 53 | 55..=63)
     }
 }
 
@@ -458,8 +445,10 @@ mod platform {
         std::thread::Builder::new()
             .name("typing-duck".into())
             .spawn(move || {
-                let mut files: Vec<File> =
-                    devices.into_iter().filter_map(|path| File::open(path).ok()).collect();
+                let mut files: Vec<File> = devices
+                    .into_iter()
+                    .filter_map(|path| File::open(path).ok())
+                    .collect();
                 if files.is_empty() {
                     return;
                 }
