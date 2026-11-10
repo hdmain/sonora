@@ -88,7 +88,12 @@ fn start(playback: Entity<Playback>, cx: &mut App) -> Option<Watch> {
             let Some(playback) = playback.upgrade() else {
                 break;
             };
-            playback.update(cx, |playback, cx| playback.note_typing(cx));
+            if playback
+                .update(cx, |playback, cx| playback.note_typing(cx))
+                .is_err()
+            {
+                break;
+            }
             cx.background_executor().timer(PULSE).await;
             while rx.try_recv().is_ok() {
                 pending.store(false, Ordering::Relaxed);
